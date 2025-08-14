@@ -290,6 +290,9 @@ static void dpdk_gather_data(unsigned char *data, uint32_t len, struct rte_mbuf 
 	}
 }
 
+static int pcap_dpdk_ethdev_rx_burst(struct pcap_dpdk *pd, struct rte_mbuf **pkts_burst, const uint16_t burst_cnt) {
+		return rte_eth_rx_burst(pd->portid, 0, pkts_burst, burst_cnt);
+}
 
 static int dpdk_read_with_timeout(pcap_t *p, struct rte_mbuf **pkts_burst, const uint16_t burst_cnt){
 	struct pcap_dpdk *pd = (struct pcap_dpdk*)(p->priv);
@@ -298,12 +301,12 @@ static int dpdk_read_with_timeout(pcap_t *p, struct rte_mbuf **pkts_burst, const
 	int sleep_ms = 0;
 	if (pd->nonblock){
 		// In non-blocking mode, just read once, no matter how many packets are captured.
-		nb_rx = (int)rte_eth_rx_burst(pd->portid, 0, pkts_burst, burst_cnt);
+		nb_rx = pcap_dpdk_ethdev_rx_burst(pd, pkts_burst, burst_cnt);
 	}else{
 		// In blocking mode, read many times until packets are captured or timeout or break_loop is set.
 		// if timeout_ms == 0, it may be blocked forever.
 		while (timeout_ms == 0 || sleep_ms < timeout_ms){
-			nb_rx = (int)rte_eth_rx_burst(pd->portid, 0, pkts_burst, burst_cnt);
+			nb_rx = pcap_dpdk_ethdev_rx_burst(pd, pkts_burst, burst_cnt);
 			if (nb_rx){ // got packets within timeout_ms
 				break;
 			}else{ // no packet arrives at this round.
@@ -438,6 +441,16 @@ static int pcap_dpdk_inject(pcap_t *p, const void *buf _U_, int size _U_)
 	return PCAP_ERROR;
 }
 
+static void pcap_dpdk_ethdev_close(struct pcap_dpdk *pd)
+{
+	if (pd->must_clear_promisc)
+	{
+		rte_eth_promiscuous_disable(pd->portid);
+	}
+	rte_eth_dev_stop(pd->portid);
+	rte_eth_dev_close(pd->portid);
+}
+
 static void pcap_dpdk_close(pcap_t *p)
 {
 	struct pcap_dpdk *pd = p->priv;
@@ -445,16 +458,16 @@ static void pcap_dpdk_close(pcap_t *p)
 	{
 		return;
 	}
-	if (pd->must_clear_promisc)
-	{
-		rte_eth_promiscuous_disable(pd->portid);
-	}
-	rte_eth_dev_stop(pd->portid);
-	rte_eth_dev_close(pd->portid);
+	pcap_dpdk_ethdev_close(pd);
 	pcapint_cleanup_live_common(p);
 }
 
-static void nic_stats_display(struct pcap_dpdk *pd)
+static void pcap_dpdk_ethdev_stats_get(struct pcap_dpdk *pd)
+{
+	rte_eth_stats_get(pd->portid,&(pd->curr_stats));
+}
+
+static void pcap_dpdk_ethdev_stats_display(struct pcap_dpdk *pd)
 {
 	uint16_t portid = pd->portid;
 	struct rte_eth_stats stats;
@@ -469,7 +482,7 @@ static int pcap_dpdk_stats(pcap_t *p, struct pcap_stat *ps)
 {
 	struct pcap_dpdk *pd = p->priv;
 	calculate_timestamp(&(pd->ts_helper), &(pd->curr_ts));
-	rte_eth_stats_get(pd->portid,&(pd->curr_stats));
+	pcap_dpdk_ethdev_stats_get(pd);
 	if (ps){
 		ps->ps_recv = (u_int)pd->curr_stats.ipackets;
 		ps->ps_drop = (u_int)(pd->curr_stats.ierrors + pd->bpf_drop);
@@ -483,7 +496,7 @@ static int pcap_dpdk_stats(pcap_t *p, struct pcap_stat *ps)
 	RTE_LOG(DEBUG, USER1, "delta_usec: %-10"PRIu64" delta_pkt: %-10"PRIu64" delta_bit: %-10"PRIu64"\n", delta_usec, delta_pkt, delta_bit);
 	pd->pps = (uint64_t)(delta_pkt*1e6f/delta_usec);
 	pd->bps = (uint64_t)(delta_bit*1e6f/delta_usec);
-	nic_stats_display(pd);
+	pcap_dpdk_ethdev_stats_display(pd);
 	pd->prev_stats = pd->curr_stats;
 	pd->prev_ts = pd->curr_ts;
 	return 0;
@@ -759,10 +772,9 @@ error:
 	return PCAP_ERROR;
 }
 
-static int pcap_dpdk_activate(pcap_t *p)
+static int pcap_dpdk_ethdev_activate(pcap_t *p)
 {
 	struct pcap_dpdk *pd = p->priv;
-	pd->orig = p;
 	int ret = PCAP_ERROR;
 	uint16_t nb_ports=0;
 	uint16_t portid= DPDK_PORTID_MAX;
@@ -773,6 +785,176 @@ static int pcap_dpdk_activate(pcap_t *p)
 	struct rte_eth_dev_info dev_info;
 	int is_port_up = 0;
 	struct rte_eth_link link;
+
+		nb_ports = rte_eth_dev_count_avail();
+		if (nb_ports == 0)
+		{
+DIAG_OFF_FORMAT_TRUNCATION
+			snprintf(p->errbuf, PCAP_ERRBUF_SIZE,
+			    "dpdk error: No Ethernet ports");
+DIAG_ON_FORMAT_TRUNCATION
+			return PCAP_ERROR;
+		}
+
+		portid = portid_by_device(p->opt.device);
+		if (portid == DPDK_PORTID_MAX){
+DIAG_OFF_FORMAT_TRUNCATION
+			snprintf(p->errbuf, PCAP_ERRBUF_SIZE,
+			    "dpdk error: portid is invalid. device %s",
+			    p->opt.device);
+DIAG_ON_FORMAT_TRUNCATION
+			return PCAP_ERROR_NO_SUCH_DEVICE;
+		}
+
+		pd->portid = portid;
+
+		if (p->snapshot <= 0 || p->snapshot > MAXIMUM_SNAPLEN)
+		{
+			p->snapshot = MAXIMUM_SNAPLEN;
+		}
+		// create the mbuf pool
+		pd->pktmbuf_pool = rte_pktmbuf_pool_create(MBUF_POOL_NAME, nb_mbufs,
+			MEMPOOL_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE,
+			rte_socket_id());
+		if (pd->pktmbuf_pool == NULL)
+		{
+DIAG_OFF_FORMAT_TRUNCATION
+			dpdk_fmt_errmsg_for_rte_errno(p->errbuf,
+			    PCAP_ERRBUF_SIZE, rte_errno,
+			    "dpdk error: Cannot init mbuf pool");
+DIAG_ON_FORMAT_TRUNCATION
+			return PCAP_ERROR;
+		}
+		// config dev
+		rte_eth_dev_info_get(portid, &dev_info);
+#if (RTE_VERSION < RTE_VERSION_NUM(22, 0, 0, 0))
+		if (dev_info.tx_offload_capa & DEV_TX_OFFLOAD_MBUF_FAST_FREE)
+		{
+			local_port_conf.txmode.offloads |=DEV_TX_OFFLOAD_MBUF_FAST_FREE;
+		}
+#else
+		if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
+		{
+			local_port_conf.txmode.offloads |=RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
+		}
+#endif
+		// only support 1 queue
+		ret = rte_eth_dev_configure(portid, 1, 1, &local_port_conf);
+		if (ret < 0)
+		{
+			dpdk_fmt_errmsg_for_rte_errno(p->errbuf,
+			    PCAP_ERRBUF_SIZE, -ret,
+			    "dpdk error: Cannot configure device: port=%u",
+			    portid);
+			return PCAP_ERROR;
+		}
+		// adjust rx tx
+		ret = rte_eth_dev_adjust_nb_rx_tx_desc(portid, &nb_rxd, &nb_txd);
+		if (ret < 0)
+		{
+			dpdk_fmt_errmsg_for_rte_errno(p->errbuf,
+			    PCAP_ERRBUF_SIZE, -ret,
+			    "dpdk error: Cannot adjust number of descriptors: port=%u",
+			    portid);
+			return PCAP_ERROR;
+		}
+		// get MAC addr
+		rte_eth_macaddr_get(portid, &(pd->eth_addr));
+		eth_addr_str(&(pd->eth_addr), pd->mac_addr, DPDK_MAC_ADDR_SIZE-1);
+
+		// init one RX queue
+		rxq_conf = dev_info.default_rxconf;
+		rxq_conf.offloads = local_port_conf.rxmode.offloads;
+		ret = rte_eth_rx_queue_setup(portid, 0, nb_rxd,
+					     rte_eth_dev_socket_id(portid),
+					     &rxq_conf,
+					     pd->pktmbuf_pool);
+		if (ret < 0)
+		{
+			dpdk_fmt_errmsg_for_rte_errno(p->errbuf,
+			    PCAP_ERRBUF_SIZE, -ret,
+			    "dpdk error: rte_eth_rx_queue_setup:port=%u",
+			    portid);
+			return PCAP_ERROR;
+		}
+
+		// init one TX queue
+		txq_conf = dev_info.default_txconf;
+		txq_conf.offloads = local_port_conf.txmode.offloads;
+		ret = rte_eth_tx_queue_setup(portid, 0, nb_txd,
+				rte_eth_dev_socket_id(portid),
+				&txq_conf);
+		if (ret < 0)
+		{
+			dpdk_fmt_errmsg_for_rte_errno(p->errbuf,
+			    PCAP_ERRBUF_SIZE, -ret,
+			    "dpdk error: rte_eth_tx_queue_setup:port=%u",
+			    portid);
+			return PCAP_ERROR;
+		}
+		// Initialize TX buffers
+		tx_buffer = rte_zmalloc_socket(DPDK_TX_BUF_NAME,
+				RTE_ETH_TX_BUFFER_SIZE(MAX_PKT_BURST), 0,
+				rte_eth_dev_socket_id(portid));
+		if (tx_buffer == NULL)
+		{
+DIAG_OFF_FORMAT_TRUNCATION
+			snprintf(p->errbuf, PCAP_ERRBUF_SIZE,
+			    "dpdk error: Cannot allocate buffer for tx on port %u", portid);
+DIAG_ON_FORMAT_TRUNCATION
+			return PCAP_ERROR;
+		}
+		rte_eth_tx_buffer_init(tx_buffer, MAX_PKT_BURST);
+		// Start device
+		ret = rte_eth_dev_start(portid);
+		if (ret < 0)
+		{
+			dpdk_fmt_errmsg_for_rte_errno(p->errbuf,
+			    PCAP_ERRBUF_SIZE, -ret,
+			    "dpdk error: rte_eth_dev_start:port=%u",
+			    portid);
+			return PCAP_ERROR;
+		}
+		// set promiscuous mode
+		if (p->opt.promisc){
+			pd->must_clear_promisc=1;
+			rte_eth_promiscuous_enable(portid);
+		}
+		// check link status
+		is_port_up = check_link_status(portid, &link);
+		if (!is_port_up){
+DIAG_OFF_FORMAT_TRUNCATION
+			snprintf(p->errbuf, PCAP_ERRBUF_SIZE,
+			    "dpdk error: link is down, port=%u",portid);
+DIAG_ON_FORMAT_TRUNCATION
+			return PCAP_ERROR_IFACE_NOT_UP;
+		}
+		// reset statistics
+		rte_eth_stats_reset(pd->portid);
+		calculate_timestamp(&(pd->ts_helper), &(pd->prev_ts));
+		rte_eth_stats_get(pd->portid,&(pd->prev_stats));
+		// format pcap_t
+		pd->portid = portid;
+
+		rte_eth_dev_get_name_by_port(portid,pd->pci_addr);
+		RTE_LOG(INFO, USER1,"Port %d device: %s, MAC:%s, PCI:%s\n", portid, p->opt.device, pd->mac_addr, pd->pci_addr);
+		RTE_LOG(INFO, USER1,"Port %d Link Up. Speed %u Mbps - %s\n",
+							portid, link.link_speed,
+#if (RTE_VERSION < RTE_VERSION_NUM(22, 0, 0, 0))
+					(link.link_duplex == ETH_LINK_FULL_DUPLEX) ?
+#else
+					(link.link_duplex == RTE_ETH_LINK_FULL_DUPLEX) ?
+#endif
+						("full-duplex") : ("half-duplex\n"));
+	return 0;
+}
+
+static int pcap_dpdk_activate(pcap_t *p)
+{
+	struct pcap_dpdk *pd = p->priv;
+	pd->orig = p;
+	int ret = PCAP_ERROR;
+
 	do{
 		//init EAL; fail if we have insufficient permission
 		char dpdk_pre_init_errbuf[PCAP_ERRBUF_SIZE];
@@ -808,166 +990,10 @@ DIAG_ON_FORMAT_TRUNCATION
 			ret = PCAP_ERROR;
 			break;
 		}
-
-		nb_ports = rte_eth_dev_count_avail();
-		if (nb_ports == 0)
-		{
-DIAG_OFF_FORMAT_TRUNCATION
-			snprintf(p->errbuf, PCAP_ERRBUF_SIZE,
-			    "dpdk error: No Ethernet ports");
-DIAG_ON_FORMAT_TRUNCATION
-			ret = PCAP_ERROR;
-			break;
-		}
-
-		portid = portid_by_device(p->opt.device);
-		if (portid == DPDK_PORTID_MAX){
-DIAG_OFF_FORMAT_TRUNCATION
-			snprintf(p->errbuf, PCAP_ERRBUF_SIZE,
-			    "dpdk error: portid is invalid. device %s",
-			    p->opt.device);
-DIAG_ON_FORMAT_TRUNCATION
-			ret = PCAP_ERROR_NO_SUCH_DEVICE;
-			break;
-		}
-
-		pd->portid = portid;
-
-		if (p->snapshot <= 0 || p->snapshot > MAXIMUM_SNAPLEN)
-		{
-			p->snapshot = MAXIMUM_SNAPLEN;
-		}
-		// create the mbuf pool
-		pd->pktmbuf_pool = rte_pktmbuf_pool_create(MBUF_POOL_NAME, nb_mbufs,
-			MEMPOOL_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE,
-			rte_socket_id());
-		if (pd->pktmbuf_pool == NULL)
-		{
-DIAG_OFF_FORMAT_TRUNCATION
-			dpdk_fmt_errmsg_for_rte_errno(p->errbuf,
-			    PCAP_ERRBUF_SIZE, rte_errno,
-			    "dpdk error: Cannot init mbuf pool");
-DIAG_ON_FORMAT_TRUNCATION
-			ret = PCAP_ERROR;
-			break;
-		}
-		// config dev
-		rte_eth_dev_info_get(portid, &dev_info);
-#if (RTE_VERSION < RTE_VERSION_NUM(22, 0, 0, 0))
-		if (dev_info.tx_offload_capa & DEV_TX_OFFLOAD_MBUF_FAST_FREE)
-		{
-			local_port_conf.txmode.offloads |=DEV_TX_OFFLOAD_MBUF_FAST_FREE;
-		}
-#else
-		if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
-		{
-			local_port_conf.txmode.offloads |=RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
-		}
-#endif
-		// only support 1 queue
-		ret = rte_eth_dev_configure(portid, 1, 1, &local_port_conf);
+		ret = pcap_dpdk_ethdev_activate(p);
 		if (ret < 0)
-		{
-			dpdk_fmt_errmsg_for_rte_errno(p->errbuf,
-			    PCAP_ERRBUF_SIZE, -ret,
-			    "dpdk error: Cannot configure device: port=%u",
-			    portid);
-			ret = PCAP_ERROR;
 			break;
-		}
-		// adjust rx tx
-		ret = rte_eth_dev_adjust_nb_rx_tx_desc(portid, &nb_rxd, &nb_txd);
-		if (ret < 0)
-		{
-			dpdk_fmt_errmsg_for_rte_errno(p->errbuf,
-			    PCAP_ERRBUF_SIZE, -ret,
-			    "dpdk error: Cannot adjust number of descriptors: port=%u",
-			    portid);
-			ret = PCAP_ERROR;
-			break;
-		}
-		// get MAC addr
-		rte_eth_macaddr_get(portid, &(pd->eth_addr));
-		eth_addr_str(&(pd->eth_addr), pd->mac_addr, DPDK_MAC_ADDR_SIZE-1);
-
-		// init one RX queue
-		rxq_conf = dev_info.default_rxconf;
-		rxq_conf.offloads = local_port_conf.rxmode.offloads;
-		ret = rte_eth_rx_queue_setup(portid, 0, nb_rxd,
-					     rte_eth_dev_socket_id(portid),
-					     &rxq_conf,
-					     pd->pktmbuf_pool);
-		if (ret < 0)
-		{
-			dpdk_fmt_errmsg_for_rte_errno(p->errbuf,
-			    PCAP_ERRBUF_SIZE, -ret,
-			    "dpdk error: rte_eth_rx_queue_setup:port=%u",
-			    portid);
-			ret = PCAP_ERROR;
-			break;
-		}
-
-		// init one TX queue
-		txq_conf = dev_info.default_txconf;
-		txq_conf.offloads = local_port_conf.txmode.offloads;
-		ret = rte_eth_tx_queue_setup(portid, 0, nb_txd,
-				rte_eth_dev_socket_id(portid),
-				&txq_conf);
-		if (ret < 0)
-		{
-			dpdk_fmt_errmsg_for_rte_errno(p->errbuf,
-			    PCAP_ERRBUF_SIZE, -ret,
-			    "dpdk error: rte_eth_tx_queue_setup:port=%u",
-			    portid);
-			ret = PCAP_ERROR;
-			break;
-		}
-		// Initialize TX buffers
-		tx_buffer = rte_zmalloc_socket(DPDK_TX_BUF_NAME,
-				RTE_ETH_TX_BUFFER_SIZE(MAX_PKT_BURST), 0,
-				rte_eth_dev_socket_id(portid));
-		if (tx_buffer == NULL)
-		{
-DIAG_OFF_FORMAT_TRUNCATION
-			snprintf(p->errbuf, PCAP_ERRBUF_SIZE,
-			    "dpdk error: Cannot allocate buffer for tx on port %u", portid);
-DIAG_ON_FORMAT_TRUNCATION
-			ret = PCAP_ERROR;
-			break;
-		}
-		rte_eth_tx_buffer_init(tx_buffer, MAX_PKT_BURST);
-		// Start device
-		ret = rte_eth_dev_start(portid);
-		if (ret < 0)
-		{
-			dpdk_fmt_errmsg_for_rte_errno(p->errbuf,
-			    PCAP_ERRBUF_SIZE, -ret,
-			    "dpdk error: rte_eth_dev_start:port=%u",
-			    portid);
-			ret = PCAP_ERROR;
-			break;
-		}
-		// set promiscuous mode
-		if (p->opt.promisc){
-			pd->must_clear_promisc=1;
-			rte_eth_promiscuous_enable(portid);
-		}
-		// check link status
-		is_port_up = check_link_status(portid, &link);
-		if (!is_port_up){
-DIAG_OFF_FORMAT_TRUNCATION
-			snprintf(p->errbuf, PCAP_ERRBUF_SIZE,
-			    "dpdk error: link is down, port=%u",portid);
-DIAG_ON_FORMAT_TRUNCATION
-			ret = PCAP_ERROR_IFACE_NOT_UP;
-			break;
-		}
-		// reset statistics
-		rte_eth_stats_reset(pd->portid);
-		calculate_timestamp(&(pd->ts_helper), &(pd->prev_ts));
-		rte_eth_stats_get(pd->portid,&(pd->prev_stats));
 		// format pcap_t
-		pd->portid = portid;
 		p->fd = pd->portid;
 		if (p->snapshot <=0 || p->snapshot> MAXIMUM_SNAPLEN)
 		{
@@ -996,17 +1022,6 @@ DIAG_ON_FORMAT_TRUNCATION
 	if (ret <= PCAP_ERROR) // all kinds of error code
 	{
 		pcapint_cleanup_live_common(p);
-	}else{
-		rte_eth_dev_get_name_by_port(portid,pd->pci_addr);
-		RTE_LOG(INFO, USER1,"Port %d device: %s, MAC:%s, PCI:%s\n", portid, p->opt.device, pd->mac_addr, pd->pci_addr);
-		RTE_LOG(INFO, USER1,"Port %d Link Up. Speed %u Mbps - %s\n",
-							portid, link.link_speed,
-#if (RTE_VERSION < RTE_VERSION_NUM(22, 0, 0, 0))
-					(link.link_duplex == ETH_LINK_FULL_DUPLEX) ?
-#else
-					(link.link_duplex == RTE_ETH_LINK_FULL_DUPLEX) ?
-#endif
-						("full-duplex") : ("half-duplex\n"));
 	}
 	return ret;
 }
