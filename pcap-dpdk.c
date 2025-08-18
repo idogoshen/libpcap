@@ -68,11 +68,28 @@ export RTE_TARGET={your target name}
 
 mkdir -p build && cd build && cmake -DDPDK_DIR=$RTE_SDK/$RTE_TARGET ../ && make -s all && make -s testprogs && make install
 
-4. Link your own program with libpcap, and use DPDK with the device name as dpdk:{portid}, such as dpdk:0.
+4. Link your own program with libpcap
+
+4.a. To capture from DPDK device use "-i dpdk:<port-id>" with the device port id, such as dpdk:0.
 And you shall set DPDK configure options by environment variable DPDK_CFG
 For example, the testprogs/capturetest could be launched by:
 
 env DPDK_CFG="--log-level=debug -l0 -dlibrte_pmd_e1000.so -dlibrte_pmd_ixgbe.so -dlibrte_mempool_ring.so" ./capturetest -i dpdk:0
+
+Or
+
+4.b. To receive from primary DPDK process ring use "-i dpdk-ring:<ring-name>" with the ring name, such as dpdk-ring:net_ring0
+You shall run as secondary process to connect to a ring the primary dpdk process created
+You shall set DPDK configure options by environment variable DPDK_CFG
+
+For example, if dpdk-testpmd is used as primary process to forwards traffic to testprogs/capturetest it could be launched by:
+
+dpdk-testpmd -v --proc-type=primary -l 0,1 -a 0000:05:00.0 --vdev=net_ring0 -- -i --auto-start
+
+DPDK_CFG="-v --proc-type=secondary -l 2" ./capturetest -i  dpdk-ring:ETH_RXTX0_net_ring0
+
+(--vdev=net_ring adds ETH_RXTX<qid> prefix to the ring name)
+
 */
 
 #include <config.h>
@@ -150,6 +167,7 @@ static char dpdk_cfg_buf[DPDK_CFG_MAX_LEN];
 #define DPDK_PCI_ADDR_SIZE 16
 #define DPDK_DEF_CFG "--log-level=error -l0 -dlibrte_pmd_e1000.so -dlibrte_pmd_ixgbe.so -dlibrte_mempool_ring.so"
 #define DPDK_PREFIX "dpdk:"
+#define DPDK_RING_PREFIX "dpdk-ring:"
 #define DPDK_PORTID_MAX 65535U
 #define MBUF_POOL_NAME "mbuf_pool"
 #define DPDK_TX_BUF_NAME "tx_buffer"
@@ -180,6 +198,7 @@ struct dpdk_ts_helper{
 struct pcap_dpdk{
 	pcap_t * orig;
 	uint16_t portid; // portid of DPDK
+	struct rte_ring* ring;
 	int must_clear_promisc;
 	uint64_t bpf_drop;
 	int nonblock;
@@ -294,6 +313,17 @@ static int pcap_dpdk_ethdev_rx_burst(struct pcap_dpdk *pd, struct rte_mbuf **pkt
 		return rte_eth_rx_burst(pd->portid, 0, pkts_burst, burst_cnt);
 }
 
+static int pcap_dpdk_ring_rx_burst(struct pcap_dpdk *pd, struct rte_mbuf **pkts_burst, const uint16_t burst_cnt) {
+		return rte_ring_dequeue_burst(pd->ring, (void**)pkts_burst, burst_cnt, NULL);
+}
+
+static int pcap_dpdk_rx_burst(struct pcap_dpdk *pd, struct rte_mbuf **pkts_burst, const uint16_t burst_cnt) {
+	if (pd->ring)
+		return pcap_dpdk_ring_rx_burst(pd, pkts_burst, burst_cnt);
+	else
+		return pcap_dpdk_ethdev_rx_burst(pd, pkts_burst, burst_cnt);
+}
+
 static int dpdk_read_with_timeout(pcap_t *p, struct rte_mbuf **pkts_burst, const uint16_t burst_cnt){
 	struct pcap_dpdk *pd = (struct pcap_dpdk*)(p->priv);
 	int nb_rx = 0;
@@ -301,12 +331,12 @@ static int dpdk_read_with_timeout(pcap_t *p, struct rte_mbuf **pkts_burst, const
 	int sleep_ms = 0;
 	if (pd->nonblock){
 		// In non-blocking mode, just read once, no matter how many packets are captured.
-		nb_rx = pcap_dpdk_ethdev_rx_burst(pd, pkts_burst, burst_cnt);
+		nb_rx = pcap_dpdk_rx_burst(pd, pkts_burst, burst_cnt);
 	}else{
 		// In blocking mode, read many times until packets are captured or timeout or break_loop is set.
 		// if timeout_ms == 0, it may be blocked forever.
 		while (timeout_ms == 0 || sleep_ms < timeout_ms){
-			nb_rx = pcap_dpdk_ethdev_rx_burst(pd, pkts_burst, burst_cnt);
+			nb_rx = pcap_dpdk_rx_burst(pd, pkts_burst, burst_cnt);
 			if (nb_rx){ // got packets within timeout_ms
 				break;
 			}else{ // no packet arrives at this round.
@@ -321,6 +351,19 @@ static int dpdk_read_with_timeout(pcap_t *p, struct rte_mbuf **pkts_burst, const
 		}
 	}
 	return nb_rx;
+}
+
+static void pcap_dpdk_ring_stats_update(struct pcap_dpdk *pd, uint64_t ipackets, uint64_t ibytes)
+{
+	pd->curr_stats.ipackets += ipackets;
+	pd->curr_stats.ibytes += ibytes;
+}
+
+static void pcap_dpdk_stats_update(struct pcap_dpdk *pd, uint64_t ipackets, uint64_t ibytes)
+{
+	if (pd->ring)
+		return pcap_dpdk_ring_stats_update(pd, ipackets, ibytes);
+	// ethdev stats are updated by and pulled from the device
 }
 
 static int pcap_dpdk_dispatch(pcap_t *p, int max_cnt, pcap_handler cb, u_char *cb_arg)
@@ -394,6 +437,7 @@ static int pcap_dpdk_dispatch(pcap_t *p, int max_cnt, pcap_handler cb, u_char *c
 			caplen = pkt_len < (uint32_t)p->snapshot ? pkt_len: (uint32_t)p->snapshot;
 			pcap_header.caplen = caplen;
 			pcap_header.len = pkt_len;
+			pcap_dpdk_stats_update(pd, 1, caplen);
 			// volatile prefetch
 			rte_prefetch0(rte_pktmbuf_mtod(m, void *));
 			bp = NULL;
@@ -458,7 +502,9 @@ static void pcap_dpdk_close(pcap_t *p)
 	{
 		return;
 	}
-	pcap_dpdk_ethdev_close(pd);
+	if (!pd->ring)
+		pcap_dpdk_ethdev_close(pd);
+	// ring life cycle is mannaged by the primary process
 	pcapint_cleanup_live_common(p);
 }
 
@@ -466,6 +512,14 @@ static void pcap_dpdk_ethdev_stats_get(struct pcap_dpdk *pd)
 {
 	rte_eth_stats_get(pd->portid,&(pd->curr_stats));
 }
+
+static void pcap_dpdk_stats_get(struct pcap_dpdk *pd)
+{
+	if (!pd->ring)
+		pcap_dpdk_ethdev_stats_get(pd);
+	// ring stats are updated on the fly in dispatch
+}
+
 
 static void pcap_dpdk_ethdev_stats_display(struct pcap_dpdk *pd)
 {
@@ -478,11 +532,29 @@ static void pcap_dpdk_ethdev_stats_display(struct pcap_dpdk *pd)
 	RTE_LOG(INFO,USER1, "portid:%d, RX-PPS: %-10"PRIu64" RX-Mbps: %.2lf\n", portid, pd->pps, pd->bps/1e6f );
 }
 
+static void pcap_dpdk_ring_stats_display(pcap_t *p)
+{
+	struct pcap_dpdk *pd = p->priv;
+
+	RTE_LOG(INFO,USER1, "%s, RX-packets: %-10"PRIu64"  RX-bytes:  %-10"PRIu64"\n",
+			p->opt.device, pd->curr_stats.ipackets, pd->curr_stats.ibytes);
+	RTE_LOG(INFO,USER1, "%s, RX-PPS: %-10"PRIu64" RX-Mbps: %.2lf\n", p->opt.device, pd->pps, pd->bps/1e6f );
+}
+
+static void pcap_dpdk_stats_display(pcap_t *p)
+{
+	struct pcap_dpdk *pd = p->priv;
+	if (pd->ring)
+		pcap_dpdk_ring_stats_display(p);
+	else
+		pcap_dpdk_ethdev_stats_display(pd);
+}
+
 static int pcap_dpdk_stats(pcap_t *p, struct pcap_stat *ps)
 {
 	struct pcap_dpdk *pd = p->priv;
 	calculate_timestamp(&(pd->ts_helper), &(pd->curr_ts));
-	pcap_dpdk_ethdev_stats_get(pd);
+	pcap_dpdk_stats_get(pd);
 	if (ps){
 		ps->ps_recv = (u_int)pd->curr_stats.ipackets;
 		ps->ps_drop = (u_int)(pd->curr_stats.ierrors + pd->bpf_drop);
@@ -496,7 +568,7 @@ static int pcap_dpdk_stats(pcap_t *p, struct pcap_stat *ps)
 	RTE_LOG(DEBUG, USER1, "delta_usec: %-10"PRIu64" delta_pkt: %-10"PRIu64" delta_bit: %-10"PRIu64"\n", delta_usec, delta_pkt, delta_bit);
 	pd->pps = (uint64_t)(delta_pkt*1e6f/delta_usec);
 	pd->bps = (uint64_t)(delta_bit*1e6f/delta_usec);
-	pcap_dpdk_ethdev_stats_display(pd);
+	pcap_dpdk_stats_display(p);
 	pd->prev_stats = pd->curr_stats;
 	pd->prev_ts = pd->curr_ts;
 	return 0;
@@ -949,11 +1021,30 @@ DIAG_ON_FORMAT_TRUNCATION
 	return 0;
 }
 
+static int pcap_dpdk_ring_activate(pcap_t *p)
+{
+	struct pcap_dpdk *pd = p->priv;
+	const char* ring_name = p->opt.device + strlen(DPDK_RING_PREFIX);
+
+	pd->ring = rte_ring_lookup(ring_name);
+	if (!pd->ring)
+	{
+		dpdk_fmt_errmsg_for_rte_errno(p->errbuf,
+				PCAP_ERRBUF_SIZE, rte_errno,
+				"dpdk error: rte_ring_lookup(%s)", ring_name);
+		return PCAP_ERROR_NO_SUCH_DEVICE;
+	}
+	calculate_timestamp(&(pd->ts_helper), &(pd->prev_ts));
+	RTE_LOG(INFO, USER1,"Ring %s\n", p->opt.device);
+	return 0;
+}
+
 static int pcap_dpdk_activate(pcap_t *p)
 {
 	struct pcap_dpdk *pd = p->priv;
 	pd->orig = p;
 	int ret = PCAP_ERROR;
+	int is_ring = !strncmp(p->opt.device, DPDK_RING_PREFIX, strlen(DPDK_RING_PREFIX));
 
 	do{
 		//init EAL; fail if we have insufficient permission
@@ -990,7 +1081,10 @@ DIAG_ON_FORMAT_TRUNCATION
 			ret = PCAP_ERROR;
 			break;
 		}
-		ret = pcap_dpdk_ethdev_activate(p);
+		if (is_ring)
+			ret = pcap_dpdk_ring_activate(p);
+		else
+			ret = pcap_dpdk_ethdev_activate(p);
 		if (ret < 0)
 			break;
 		// format pcap_t
@@ -1032,7 +1126,8 @@ pcap_t * pcap_dpdk_create(const char *device, char *ebuf, int *is_ours)
 	pcap_t *p=NULL;
 	*is_ours = 0;
 
-	*is_ours = !strncmp(device, "dpdk:", 5);
+	*is_ours = !strncmp(device, "dpdk:", 5) ||
+			!strncmp(device, DPDK_RING_PREFIX, strlen(DPDK_RING_PREFIX));
 	if (! *is_ours)
 		return NULL;
 	//memset will happen
